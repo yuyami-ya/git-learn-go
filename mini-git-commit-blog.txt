@@ -1,0 +1,274 @@
+前章ではaddコマンドを使って、ファイルをハッシュ化（blobの作成）し、ステージングエリア.mini_git/indexに登録する仕組みを整えました。
+これにより、「どのファイルをコミット対象とするか」が決まりました。しかし、まだ「コミット（履歴として確定）」する段階が残っています。コミットを実装しないと、ステージングに置いたファイルは履歴として残らず、バージョン管理の意味がなくなってしまいます。
+
+そこで今回は、本家Gitのgit commitに相当する「commit」コマンドを作成し、ステージングされたファイル一式をスナップショットとして保存し、Gitライクな履歴管理を実現していきましょう。
+
+コミットは何をしているのか
+実際のGitでは、コミットを行うと「treeオブジェクトを作成し、そのtreeを指すcommitオブジェクトを生成し、親コミットとのつながりを記録する」という一連の処理が行われます。
+
+treeオブジェクトとは？
+treeオブジェクトは、プロジェクト内のファイルやディレクトリの構造を表現します。
+これはまるでプロジェクト全体の「写真」のようなもので、どのファイルがどのディレクトリにあるかを詳細に記録します。
+
+commitオブジェクトとは？
+commitオブジェクトは、「どのtreeを使っているか」、「親コミット（前の履歴）は何か」、「コミットメッセージは何か」といった情報を含みます。これにより、履歴が一つ一つのコミットとして積み重なっていきます。
+
+mini-gitでのコミット
+一方、今回のmini-gitでは、treeオブジェクトの実装を省略し、もっとシンプルにしています。
+具体的には、ステージングエリア（index）の内容（ファイル名とblobハッシュの対応）をそのままコミット時のスナップショットとして採用し、それを直接保存します。
+
+つまり、「コミットオブジェクトの中にindexの内容をそのまま詰め込む」形です。
+
+このシンプルなアプローチにより、mini-gitはGitの基本的な機能を理解しやすい形で再現しています。これで、ステージングされたファイルを一つのコミットとして確定し、履歴として残す準備が整いました。
+
+commitオブジェクトの構造（mini-git版）
+mini-gitで作るcommitオブジェクトは、以下のような文字列をまとめたものにします。
+
+tree (JSONなどでindexの内容をシリアライズしたもの)
+parent <親コミットID>
+message <コミットメッセージ>
+
+これをテキスト形式にして、SHA-1ハッシュを計算し、.mini_git/objects/に保存します。
+その後、現在のブランチファイル（たとえば.mini_git/refs/heads/master）を、このcommitのハッシュ値で更新することで「今のブランチの先端が新しいコミットになった」状態を作ります。
+
+commitの実装ステップ
+次にcommitを実装するために処理の流れを説明します。
+
+1.ステージングエリアの読み込み
+コミットする対象は「ステージングされているファイル」なので、まずは.mini_git/indexを読み込みます。
+もしステージングエリアが空（要するにindexが空）なら、「コミットするものがないよ」というエラーを出して終了してもいいでしょう。
+
+2.親コミットを調べる
+Gitにおける「コミットの履歴」は、parentをたどるリスト構造で表現されます。
+mini-gitでは、現在のブランチ（HEADが参照しているブランチ）のファイルを読めば、そこに最新コミットIDが書いてあるはずです。
+もしまだコミットがない場合は空の文字列（""）になるかもしれませんが、それは「このコミットが最初」だということを意味します。
+
+3.commitオブジェクトの作成と保存
+続いて、commitオブジェクトの作成を行います。
+commitオブジェクトは先ほども説明した通り、以下のような構造を持ちます。
+
+tree (JSONなどでindexの内容をシリアライズしたもの)
+parent <親コミットID>
+message <コミットメッセージ>
+
+そのために、以下の流れでcommitオブジェクトの作成を行います。
+
+.mini_git/indexの中身（ファイル名→ハッシュの対応）をJSONなどで文字列化した上で、 tree ... の行として記録
+parent <親コミットID>の行を作る
+message <コミットメッセージ>の行を作る
+これらをまとめた文字列をエンコードし、hash_object()関数でハッシュ化 → .mini_git/objects/に保存
+このような流れでcommitオブジェクトを作成する処理を行います。
+4.ブランチ（HEAD）の更新
+「コミットが成功したら、そのコミットIDを現在のブランチファイルに書き込む」ことで、ブランチの先端を新しいコミットにします。
+たとえば、masterブランチなら.mini_git/refs/heads/masterにコミットIDを書く。
+HEADがref: refs/heads/masterを指しているなら、それが「今のmasterブランチが指すコミットIDはこれですよ」という更新につながります。
+
+commit関数の実装
+ここまで説明した内容をPythonで実装します。
+以下のようなPythonコードが考えられます。
+（※前章で作ったhash_object()やread_index()などの関数を使います。またget_head_commit()とget_current_branch()は後ほど実装します。）
+
+mini_git.py
+import json
+import time
+
+def commit_changes(message):
+    """
+    ステージングエリアにあるファイルをコミットとして確定し、
+    コミットオブジェクトを作成して保存します。
+    """
+    # indexを読み込む
+    index_dict = read_index()
+    if not index_dict:
+        print("Nothing to commit (index is empty).")
+        return
+
+    # 親コミットを取得
+    parent = get_head_commit()  # HEADが指すコミットを取得
+
+    # indexの内容をJSONにする
+    tree_data = json.dumps(index_dict)
+
+    # commitオブジェクトの文字列を組み立て
+    commit_str = f"tree {tree_data}\n"
+    commit_str += f"parent {parent}\n"
+    commit_str += f"message {message}\n"
+
+    # オブジェクトとして保存してsha1を得る
+    commit_sha = hash_object(commit_str.encode('utf-8'))
+
+    # 現在のブランチファイルを更新
+    current_branch = get_current_branch()  # HEADが指すブランチ名を取得
+    if current_branch:
+        branch_file = os.path.join(HEADS_DIR, current_branch)
+        with open(branch_file, 'w') as f:
+            f.write(commit_sha)
+    else:
+        # デタッチ状態の場合は、HEADファイルに直接書いてもいい
+        with open(HEAD_FILE, 'w') as f:
+            f.write(commit_sha)
+
+    print(f"Committed as {commit_sha}")
+
+上記のコードの解説です。
+
+parentフィールドに前のコミットハッシュを書き込む
+これにより、コミット履歴をどんどんつなげていけます。
+treeにはindexの内容をJSON化したものを保存
+これでコミット時点の「ファイル名とblobハッシュ」がわかります。
+messageは引数のメッセージを挿入
+python mini_git.py commit "初回のコミットメッセージ"のように実行した場合、コミットのメッセージを引数から取得します。後ほどmain()関数を修正した際に、messageを渡すようにします。
+親コミットの取得とブランチの判定
+上記コードで使っているget_head_commit()とget_current_branch()は、次のように書けます。
+
+def get_head_commit():
+    """
+    HEADが指すコミットハッシュを返す
+    まだコミットが無い場合は空文字を返す
+    """
+    if not os.path.exists(HEAD_FILE):
+        return ""
+
+    with open(HEAD_FILE, 'r') as f:
+        ref = f.read().strip()
+
+    if ref.startswith("ref:"):
+        # 例: "ref: refs/heads/master"
+        ref_path = ref.split(":", 1)[1].strip()
+        full_ref_path = os.path.join(MINI_GIT_DIR, ref_path)
+        if os.path.exists(full_ref_path):
+            with open(full_ref_path, 'r') as rf:
+                return rf.read().strip()
+        else:
+            return ""
+    else:
+        # refがコミットIDを直接書いている(デタッチ状態)
+        return ref
+
+def get_current_branch():
+    """
+    HEADが "ref: refs/heads/<branch_name>" の形なら<branch_name>を返す。
+    デタッチ状態ならNoneを返す。
+    """
+    with open(HEAD_FILE, 'r') as f:
+        ref = f.read().strip()
+    if ref.startswith("ref:"):
+        ref_path = ref.split(":", 1)[1].strip()
+        return os.path.basename(ref_path)
+    else:
+        return None
+
+get_head_commit()関数の解説
+get_head_commit()関数は、現在のHEADが指している最新のコミットIDを取得する役割を持っています。
+
+具体的には、以下のような動作を行います。
+まず、HEADがどのコミットを指しているかを確認します。HEADがブランチを指している場合、そのブランチの最新コミットIDを返します。例えば、master ブランチが最新のコミットを指している場合、そのコミットIDが返されます。
+
+一方で、HEADが「デタッチ状態」と呼ばれる特別な状態にある場合、直接特定のコミットIDを指しています。このときは、そのコミットID自体を返します。デタッチ状態とは、特定のブランチではなく、任意のコミットに直接移動している状態を指します。
+
+さらに、まだ一度もコミットが行われていない場合、つまりリポジトリが初期化されたばかりでコミット履歴が存在しない場合は、空文字（""）を返します。これにより、コミットが存在しないことを簡単に確認できます。
+
+get_current_branch()関数の解説
+get_current_branch()関数は、現在作業しているブランチ名を取得するための関数です。
+
+まず、HEADがどのブランチを指しているかを確認します。HEADがブランチを指している場合、そのブランチ名を返します。例えば、現在作業しているブランチがdevelopであれば、この関数は "develop"を返します。
+
+一方で、HEADがデタッチ状態にある場合、つまり特定のブランチではなく直接コミットIDを指している場合は、Noneを返します。デタッチ状態では、ブランチに属さない特定のコミットに基づいて作業を行っているため、ブランチ名が存在しません。
+
+このように、get_current_branch()関数を使用することで、現在作業中のブランチを簡単に把握でき、ブランチの状態に応じた適切な操作を行うことが可能になります。
+
+commitコマンドの組み込み
+では、前章と同じようにmini_git.pyにこのコードを組み込み、コマンドライン引数によって commit_changesを呼び出すように書いてみます。
+main()関数を以下のように編集します。
+
+mini_git.py
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: mini_git <command> [<args>]")
+        sys.exit(1)
+
+    command = sys.argv[1]
+
+    if command == 'init':
+        init_repo()
+    elif command == 'add':
+        if len(sys.argv) < 3:
+            print("Usage: mini_git add <filename>")
+            sys.exit(1)
+        add_file(sys.argv[2])
+    elif command == 'commit':
+        if len(sys.argv) < 3:
+            print("Usage: mini_git commit <message>")
+            sys.exit(1)
+        commit_message = sys.argv[2]
+        commit_changes(commit_message)
+    else:
+        print(f"Unknown command: {command}")
+
+これで実装は完了です！
+
+ここまでのmini_git.pyの全文
+動作確認
+1.リポジトリの初期化~add(前回実行していない場合)
+まずは、mini-gitリポジトリを初期化~addまでを行います。
+前回実行している方は飛ばしてください。
+
+$ python mini_git.py init
+
+続いて、ファイルの追加して、ステージングエリアに追加します。
+
+$ echo "Hello, mini-git!" > hello.txt
+$ python mini_git.py add hello.txt
+#Added hello.txt to index with hash 8c3db2...
+
+ここまでは、前回の動作確認と同じです。
+
+2.commitコマンドの動作確認
+今回作成したcommitコマンドを実行します。
+以下のコマンドを実行しましょう。
+
+$ python mini_git.py commit "初回のコミットメッセージ"
+Committed as 556bd5b4...
+
+コマンドの文法は、python mini_git.py commit <コミットメッセージ>となります。<コミットメッセージ>には、任意の文字を入力します。通常のGitであれば、どのような変更をしたのかを記述しておきます。
+コマンドを実行すると、作成されたコミットのハッシュ値を含むメッセージを表示します。
+
+コミットが正しく作成されたかを確認
+最後に、コミットが正しく作成されたかを確認してみましょう。
+
+& cat .mini_git/refs/heads/master
+#556bd5b4...
+
+.mini_git/refs/heads/masterファイルには、masterブランチが指している最新のコミットハッシュが書かれています。先ほど生成されたハッシュが書かれているはずです。
+
+また、.mini_git/objects/フォルダを覗くと、commitオブジェクトが一つ増えているのがわかります。
+
+& ls .mini_git/objects/
+
+.mini_git/objects/ フォルダには、コミットオブジェクトが保存されています。新しく作成されたコミットのハッシュ値556bd5b4...という名前のファイルが存在していることを確認します。
+このファイルには、コミットの詳細情報が含まれています。
+
+indexの中身はクリアされる？
+今回の実装例では、コミットが終わっても.mini_git/indexの内容は消していません（本家Gitだとコミット後にステージングがクリアされます）。
+mini-gitをシンプルにするため、そこまで再現していませんが、気になる方は「コミット後にindex を空にする」処理を追加してみてもよいでしょう。
+
+2回目以降のコミットでparentがつながる
+一度コミットを行った後、さらにファイルに変更を加えて再度addコマンドとcommitコマンドを実行すると、前回のコミットIDが新しいコミットのparentとして記録されます。
+以下は2回目以降のコミットオブジェクトの中身です。(実際には圧縮されています)
+
+tree {"hello.txt": "9a1f3c..."}
+parent 556bd5b4...
+message 2回目のコミットメッセージ
+
+これにより、コミット履歴が連続してつながり、まるでチェーンのように一貫した履歴が形成されます。
+
+番外編:圧縮されたコミットオブジェクトの中身を確認する
+この章のまとめ
+この章のまとめです。
+
+commitは「ステージングされたファイルのスナップショット」をオブジェクト化して保存する作業。
+mini-gitでは、indexの内容をまとめてJSON化し、それを含むテキストを一つのcommitオブジェクトとして.mini_git/objects/に保存する。
+parentというフィールドを持たせることで、コミット履歴をたどることができる。
+コミット完了後、現在のブランチファイルに新しいコミットIDを書き込むことで、ブランチの先端を更新する。
+これで「init → add → commit」といった、Gitの基本的な「バージョンを積み重ねていく」流れをひととおり再現できました。
+次章では、このコミット履歴をさかのぼって表示する「log」コマンドを実装し、実際にコミット履歴がどのようににつながっているかを確認してみましょう。

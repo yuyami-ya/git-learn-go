@@ -41,80 +41,128 @@ func main() {
 	}
 }
 
+// initRepo はmini-gitリポジトリを初期化する。
+// .mini_git/ ディレクトリと必要なサブディレクトリ、ファイルを作成する。
 func initRepo() {
-	// ここでinitコマンドの実装を行う
-	fmt.Println("init command executed")
+	// 既に .mini_git が存在する場合は警告して終了
+	if _, err := os.Stat(miniGitDir); err == nil {
+		fmt.Printf("%s already exists\n", miniGitDir)
+		return
+	}
+
+	// .mini_gitディレクトリとサブディレクトリを作成
 	os.MkdirAll(objectsDir, 0755)
 	os.MkdirAll(refsDir, 0755)
 	os.MkdirAll(headsDir, 0755)
-	os.WriteFile(headFile, []byte("ref: refs/heads/main"), 0644)
+
+	// HEADファイルの初期化（masterブランチを指す）
+	os.WriteFile(headFile, []byte("ref: refs/heads/master\n"), 0644)
+
+	// indexファイル（空）を作成
 	os.WriteFile(indexFile, []byte(""), 0644)
+
+	// デフォルトのブランチ: masterのファイルを作成（空）
+	masterFile := filepath.Join(headsDir, "master")
+	os.WriteFile(masterFile, []byte(""), 0644)
+
+	fmt.Printf("Initialized empty mini-git repository in %s\n", miniGitDir)
 }
 
+// hashObject はデータのSHA-1ハッシュを計算して返す。
 func hashObject(data []byte) string {
 	h := sha1.New()
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// saveObject はオブジェクトを .mini_git/objects/<hash> に保存する。
+// 既に同名のオブジェクトが存在すれば保存はスキップする。
 func saveObject(hash string, data []byte) error {
-	dir := filepath.Join(objectsDir, hash[:2])
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+	objPath := filepath.Join(objectsDir, hash)
+
+	// 既に存在すればスキップ
+	if _, err := os.Stat(objPath); err == nil {
+		return nil
 	}
-	path := filepath.Join(dir, hash[2:])
-	return os.WriteFile(path, data, 0644)
+
+	return os.WriteFile(objPath, data, 0644)
 }
 
-func updateIndex(hash, path string) error {
+// readIndex は .mini_git/index を読み込んで、
+// {filename: sha1} の map を返す。
+func readIndex() map[string]string {
+	indexMap := make(map[string]string)
+
 	data, err := os.ReadFile(indexFile)
 	if err != nil {
-		return err
+		return indexMap
 	}
 
-	lines := strings.Split(string(data), "\n")
-	newLine := hash + " " + path
-	updated := false
-	var result []string
-
-	for _, line := range lines {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		parts := strings.SplitN(line, " ", 2)
-		if len(parts) == 2 && parts[1] == path {
-			result = append(result, newLine)
-			updated = true
-		} else {
-			result = append(result, line)
+		if len(parts) == 2 {
+			indexMap[parts[0]] = parts[1]
 		}
 	}
 
-	if !updated {
-		result = append(result, newLine)
-	}
-
-	return os.WriteFile(indexFile, []byte(strings.Join(result, "\n")+"\n"), 0644)
+	return indexMap
 }
 
+// writeIndex は {filename: sha1} の map を .mini_git/index に書き出す。
+func writeIndex(indexMap map[string]string) error {
+	var lines []string
+	for fname, sha := range indexMap {
+		lines = append(lines, fmt.Sprintf("%s %s", fname, sha))
+	}
+
+	content := ""
+	if len(lines) > 0 {
+		content = strings.Join(lines, "\n") + "\n"
+	}
+
+	return os.WriteFile(indexFile, []byte(content), 0644)
+}
+
+// addFile は指定されたファイルをステージングエリアに追加する。
+// ファイルをハッシュ化し、オブジェクトとして保存し、indexを更新する。
 func addFile(path string) {
+	// ファイルが存在するか確認
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		fmt.Printf("Error: %s does not exist.\n", path)
+		return
+	}
+
+	// ファイル内容をバイナリで読み込む
 	data, err := os.ReadFile(path)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
-	hash := hashObject(data)
+	// blobとしてハッシュを計算
+	sha1Hash := hashObject(data)
 
-	if err := saveObject(hash, data); err != nil {
-		fmt.Println(err)
+	// objectsに保存
+	if err := saveObject(sha1Hash, data); err != nil {
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
-	if err := updateIndex(hash, path); err != nil {
-		fmt.Println(err)
+	// indexを読み込む
+	indexMap := readIndex()
+
+	// indexにfilename: sha1 を登録（更新）
+	indexMap[path] = sha1Hash
+
+	// indexを書き出す
+	if err := writeIndex(indexMap); err != nil {
+		fmt.Printf("Error: %v\n", err)
 		return
 	}
 
-	fmt.Printf("add '%s'\n", path)
+	fmt.Printf("Added %s to index with hash %s\n", path, sha1Hash)
 }
